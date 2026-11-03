@@ -1,0 +1,82 @@
+version: 2
+
+models:
+  - name: mart_executive_kpis
+    description: Single-row executive KPI snapshot (revenue, orders, AOV, rates).
+    columns:
+      - name: gross_revenue
+        tests: [not_null]
+      - name: payment_success_rate_pct
+        tests: [not_null]
+
+  - name: mart_daily_sales
+    description: Daily sales grain with 7-day moving average revenue.
+    columns:
+      - name: order_date
+        tests: [not_null, unique]
+
+  - name: mart_monthly_revenue
+    description: Monthly revenue with month-over-month growth.
+    columns:
+      - name: year_month
+        tests: [not_null, unique]
+
+  - name: mart_product_performance
+    description: Product-level revenue, profit, margin and return rate.
+    columns:
+      - name: product_id
+        tests: [not_null, unique]
+      - name: category
+        tests: [not_null]
+
+  - name: mart_customer_rfm
+    description: Customer 360 with RFM scoring, CLV and segment labels.
+    columns:
+      - name: customer_sk
+        tests: [not_null, unique]
+      - name: customer_id
+        tests: [not_null]
+      - name: segment
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - Champions
+                - Loyal Customers
+                - New Customers
+                - Potential Loyalists
+                - At Risk
+                - Cant Lose Them
+                - Hibernating
+
+  - name: mart_order_funnel
+    description: Monthly order funnel, payment and fulfilment rates.
+    columns:
+      - name: year_month
+        tests: [not_null, unique]
+
+  - name: mart_regional_sales
+    description: Revenue by region and state with share of total.
+    columns:
+      - name: region
+        tests: [not_null]
+
+  - name: mart_payment_analytics
+    description: Payment attempt success and failure rates by method.
+    columns:
+      - name: payment_method
+        tests: [not_null, unique]
+
+  - name: mart_return_analytics
+    description: Returns by category and reason with refund exposure.
+    columns:
+      - name: category
+        tests: [not_null]
+
+  - name: mart_cohort_retention
+    description: Monthly acquisition cohort retention matrix.
+    columns:
+      - name: cohort_month
+        tests: [not_null]
+      - name: month_index
+        tests: [not_null]

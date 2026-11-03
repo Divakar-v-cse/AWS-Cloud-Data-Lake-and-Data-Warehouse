@@ -1,0 +1,22 @@
+name: divakar_analytics
+version: "1.0.0"
+config-version: 2
+
+profile: divakar_analytics
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  divakar_analytics:
+    staging:
+      +materialized: view
+      +schema: staging
+    marts:
+      +materialized: table
+      +schema: marts
+
+vars:
+  revenue_statuses: "('completed','returned')"

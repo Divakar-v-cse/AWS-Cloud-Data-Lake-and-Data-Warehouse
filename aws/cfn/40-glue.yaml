@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Divakar Cloud Data Lake - AWS Glue ETL jobs (bronze->silver->gold) and the
+  crawler that registers the gold layer in the Data Catalog for Athena.
+  Stack 4 of 5.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+  ScriptsBucket:
+    Type: String
+    Description: Artifacts bucket holding the uploaded PySpark scripts.
+
+  ScriptsPrefix:
+    Type: String
+    Default: glue
+
+  GlueRoleArn:
+    Type: String
+
+  BronzeBucket:
+    Type: String
+  SilverBucket:
+    Type: String
+  GoldBucket:
+    Type: String
+
+  GoldDatabaseName:
+    Type: String
+    Default: divakar_gold_dev
+
+  WorkerType:
+    Type: String
+    Default: G.1X
+    AllowedValues: [G.025X, G.1X, G.2X]
+
+  NumberOfWorkers:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 20
+
+  JobTimeoutMinutes:
+    Type: Number
+    Default: 60
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # bronze -> silver: same cleaning rules as src/silver.py (typed schema,
+  # drop rows with no key/timestamp, de-duplicate on the business key).
+  # ---------------------------------------------------------------------------
+  BronzeToSilverJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "divakar-bronze-to-silver-${Environment}"
+      Description: Clean and type raw CSV into partitioned Parquet
+      Role: !Ref GlueRoleArn
+      GlueVersion: "4.0"
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${ScriptsBucket}/${ScriptsPrefix}/bronze_to_silver.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-language": python
+        "--job-bookmark-option": job-bookmark-disable
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--enable-spark-ui": "true"
+        "--spark-event-logs-path": !Sub "s3://${ScriptsBucket}/spark-ui/"
+        "--bronze_bucket": !Sub "s3://${BronzeBucket}"
+        "--silver_bucket": !Sub "s3://${SilverBucket}"
+        "--TempDir": !Sub "s3://${ScriptsBucket}/tmp/bronze-to-silver/"
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxRetries: 1
+      Timeout: !Ref JobTimeoutMinutes
+      WorkerType: !Ref WorkerType
+      NumberOfWorkers: !Ref NumberOfWorkers
+
+  # ---------------------------------------------------------------------------
+  # silver -> gold: business aggregates (daily sales, monthly revenue, RFM,
+  # cohorts, product performance, payment and return analytics).
+  # ---------------------------------------------------------------------------
+  SilverToGoldJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "divakar-silver-to-gold-${Environment}"
+      Description: Build business aggregates from silver Parquet
+      Role: !Ref GlueRoleArn
+      GlueVersion: "4.0"
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${ScriptsBucket}/${ScriptsPrefix}/silver_to_gold.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-language": python
+        "--job-bookmark-option": job-bookmark-disable
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--silver_bucket": !Sub "s3://${SilverBucket}"
+        "--gold_bucket": !Sub "s3://${GoldBucket}"
+        "--TempDir": !Sub "s3://${ScriptsBucket}/tmp/silver-to-gold/"
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxRetries: 1
+      Timeout: !Ref JobTimeoutMinutes
+      WorkerType: !Ref WorkerType
+      NumberOfWorkers: !Ref NumberOfWorkers
+
+  # ---------------------------------------------------------------------------
+  # Catalog crawler so Athena can query gold without hand-written DDL.
+  # ---------------------------------------------------------------------------
+  GoldCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "divakar-gold-crawler-${Environment}"
+      Role: !Ref GlueRoleArn
+      DatabaseName: !Ref GoldDatabaseName
+      Description: Registers gold Parquet datasets in the Data Catalog
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${GoldBucket}/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" }
+          },
+          "Grouping": { "TableGroupingPolicy": "CombineCompatibleSchemas" }
+        }
+
+Outputs:
+  BronzeToSilverJobName:
+    Value: !Ref BronzeToSilverJob
+  SilverToGoldJobName:
+    Value: !Ref SilverToGoldJob
+  GoldCrawlerName:
+    Value: !Ref GoldCrawler

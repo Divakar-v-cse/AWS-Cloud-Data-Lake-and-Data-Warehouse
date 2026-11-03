@@ -1,0 +1,493 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Divakar Cloud Data Lake - event-driven runtime. Two Lambda functions
+  (bronze ingestion + Redshift Data API loader), three EventBridge rules that
+  chain ingest -> Glue bronze/silver -> Glue silver/gold -> warehouse load,
+  CloudWatch alarms, an SNS alert topic and one operations dashboard.
+  Stack 5 of 5.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+  ArtifactsBucket:
+    Type: String
+    Description: Bucket holding the Lambda zips, the Glue scripts and the raw replay exports.
+
+  LambdaPrefix:
+    Type: String
+    Default: lambda
+
+  PipelineCodeKey:
+    Type: String
+    Default: pipeline.zip
+    Description: Object key of the orchestrator zip, relative to LambdaPrefix.
+
+  LoaderCodeKey:
+    Type: String
+    Default: loader.zip
+
+  PipelineRoleArn:
+    Type: String
+  LoaderRoleArn:
+    Type: String
+
+  BronzeBucket:
+    Type: String
+  GoldBucket:
+    Type: String
+
+  BronzeJobName:
+    Type: String
+    Description: Glue job that produces silver.
+  GoldJobName:
+    Type: String
+    Description: Glue job that produces gold.
+  GoldCrawlerName:
+    Type: String
+    Default: ""
+
+  WorkgroupName:
+    Type: String
+  DatabaseName:
+    Type: String
+    Default: analytics
+  DbUser:
+    Type: String
+    Default: deuser
+  RedshiftSecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      Managed admin-password secret ARN for the Serverless namespace. When set,
+      the loader authenticates with the secret instead of a DbUser, so no
+      password ever reaches the function.
+
+  CopyRoleArn:
+    Type: String
+    Description: IAM role Redshift assumes for COPY; substituted into the load SQL.
+
+  PartnerApiBaseUrl:
+    Type: String
+    Default: ""
+    Description: >
+      Base URL of the partner REST API (e.g. https://api.example.com/mock-api).
+      Leave blank to use the replay channel: raw exports uploaded by
+      scripts/deploy_aws.py are copied into bronze byte-for-byte.
+
+  PartnerApiSecretArn:
+    Type: String
+    Default: ""
+    Description: Optional Secrets Manager ARN holding the partner API key.
+
+  IngestSchedule:
+    Type: String
+    Default: "cron(0 1 * * ? *)"
+    Description: Daily at 01:00 UTC. EventBridge cron uses 6 fields.
+
+  ScheduleEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Set to false to deploy everything without a recurring schedule. Useful
+      for a first, manually triggered run that should not race a timer.
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for the SNS alert topic. Confirmation is manual.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 3653
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  ScheduleIsEnabled: !Equals [!Ref ScheduleEnabled, "true"]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Log groups are declared before the functions so retention is applied from
+  # the first invocation instead of "never expire".
+  # ---------------------------------------------------------------------------
+  PipelineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/divakar-pipeline-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  LoaderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/divakar-redshift-loader-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------------------------------------------------------------------
+  # Stage 1 + 3: ingestion and Glue chain control.
+  # ---------------------------------------------------------------------------
+  PipelineFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PipelineLogGroup
+    Properties:
+      FunctionName: !Sub "divakar-pipeline-${Environment}"
+      Description: Lands raw sources in bronze and advances the Glue job chain
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !Ref PipelineRoleArn
+      MemorySize: 512
+      Timeout: 300
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: !Sub "${LambdaPrefix}/${PipelineCodeKey}"
+      Environment:
+        Variables:
+          BRONZE_BUCKET: !Ref BronzeBucket
+          ARTIFACTS_BUCKET: !Ref ArtifactsBucket
+          RAW_PREFIX: raw/
+          PARTNER_API_BASE_URL: !Ref PartnerApiBaseUrl
+          PARTNER_API_SECRET_ARN: !Ref PartnerApiSecretArn
+          BRONZE_JOB_NAME: !Ref BronzeJobName
+          GOLD_JOB_NAME: !Ref GoldJobName
+      Tags:
+        - Key: Project
+          Value: divakar-data-platform
+
+  # ---------------------------------------------------------------------------
+  # Stage 5: warehouse load through the Redshift Data API.
+  # ---------------------------------------------------------------------------
+  LoaderFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LoaderLogGroup
+    Properties:
+      FunctionName: !Sub "divakar-redshift-loader-${Environment}"
+      Description: Executes the Redshift load statements in order
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !Ref LoaderRoleArn
+      MemorySize: 512
+      # A full load issues ~40 statements; 15 minutes is the Lambda ceiling and
+      # leaves room for COPY of the largest fact table.
+      Timeout: 900
+      # Two concurrent loads would delete and insert the same key sets.
+      ReservedConcurrentExecutions: 1
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: !Sub "${LambdaPrefix}/${LoaderCodeKey}"
+      Environment:
+        Variables:
+          WORKGROUP_NAME: !Ref WorkgroupName
+          DATABASE_NAME: !Ref DatabaseName
+          DB_USER: !Ref DbUser
+          REDSHIFT_SECRET_ARN: !Ref RedshiftSecretArn
+          GOLD_BUCKET: !Ref GoldBucket
+          COPY_ROLE_ARN: !Ref CopyRoleArn
+          GOLD_CRAWLER_NAME: !Ref GoldCrawlerName
+      Tags:
+        - Key: Project
+          Value: divakar-data-platform
+
+  # ---------------------------------------------------------------------------
+  # EventBridge: schedule -> ingest -> Glue bronze/silver -> Glue silver/gold
+  # -> warehouse load. Each hop is a separate rule so a failed stage simply
+  # stops the chain instead of cascading.
+  # ---------------------------------------------------------------------------
+  IngestScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "divakar-schedule-ingest-${Environment}"
+      Description: Daily bronze ingestion followed by the Glue chain
+      ScheduleExpression: !Ref IngestSchedule
+      State: !If [ScheduleIsEnabled, ENABLED, DISABLED]
+      Targets:
+        - Id: ingest
+          Arn: !GetAtt PipelineFunction.Arn
+          Input: '{"task":"ingest"}'
+
+  BronzeSuccessRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "divakar-on-bronze-silver-success-${Environment}"
+      Description: Advances to silver->gold when the bronze job succeeds
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.glue
+        detail-type:
+          - Glue Job State Change
+        detail:
+          state:
+            - SUCCEEDED
+          jobName:
+            - !Ref BronzeJobName
+      Targets:
+        - Id: run-gold
+          Arn: !GetAtt PipelineFunction.Arn
+          Input: '{"task":"run_gold"}'
+
+  GoldSuccessRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "divakar-on-gold-success-${Environment}"
+      Description: Loads the warehouse once gold parquet is refreshed
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.glue
+        detail-type:
+          - Glue Job State Change
+        detail:
+          state:
+            - SUCCEEDED
+          jobName:
+            - !Ref GoldJobName
+      Targets:
+        - Id: load-redshift
+          Arn: !GetAtt LoaderFunction.Arn
+          Input: '{"task":"load_warehouse"}'
+
+  # Failing Glue runs page immediately instead of waiting for a metric alarm.
+  GlueFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "divakar-glue-failure-${Environment}"
+      Description: Notifies on any failed or aborted Divakar Glue job run
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.glue
+        detail-type:
+          - Glue Job State Change
+        detail:
+          state:
+            - FAILED
+            - TIMEOUT
+            - ABORTED
+      Targets:
+        - Id: alert
+          Arn: !Ref AlertsTopic
+          InputTransformer:
+            InputPathsMap:
+              job: $.detail.jobName
+              state: $.detail.state
+              run: $.detail.jobRunId
+              message: $.detail.message
+            InputTemplate: >-
+              "Glue job <job> ended in state <state> (run <run>). Details: <message>"
+
+  AllowScheduleInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PipelineFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IngestScheduleRule.Arn
+
+  AllowBronzeEventInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PipelineFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BronzeSuccessRule.Arn
+
+  AllowGoldEventInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LoaderFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GoldSuccessRule.Arn
+
+  # ---------------------------------------------------------------------------
+  # Alerting
+  # ---------------------------------------------------------------------------
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "divakar-alerts-${Environment}"
+      DisplayName: Divakar data platform alerts
+      Tags:
+        - Key: Project
+          Value: divakar-data-platform
+
+  AlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertsTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+          - Sid: AllowCloudWatchAlarmPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AlarmPipelineErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "divakar-pipeline-errors-${Environment}"
+      AlarmDescription: The ingestion/orchestration Lambda raised an error
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PipelineFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  AlarmLoaderErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "divakar-loader-errors-${Environment}"
+      AlarmDescription: The Redshift loader raised an error
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LoaderFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # ---------------------------------------------------------------------------
+  # One dashboard for the whole pipeline. Redshift Serverless widgets stay
+  # empty until the first query, which is expected on a fresh environment.
+  # ---------------------------------------------------------------------------
+  OpsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "divakar-pipeline-${Environment}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": {
+                "markdown": "# Divakar Cloud Data Lake — ${Environment}\nSchedule → ingest Lambda → Glue bronze/silver → Glue silver/gold → Redshift loader."
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 2, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda invocations and errors",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "divakar-pipeline-${Environment}", { "label": "ingest/runs" } ],
+                  [ ".", "Errors", ".", ".", { "label": "ingest errors" } ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "divakar-redshift-loader-${Environment}", { "label": "loader runs" } ],
+                  [ ".", "Errors", ".", ".", { "label": "loader errors" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 2, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda duration (p95, ms)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "period": 300,
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "divakar-pipeline-${Environment}", { "stat": "p95" } ],
+                  [ ".", ".", ".", "divakar-redshift-loader-${Environment}", { "stat": "p95" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 8, "width": 12, "height": 6,
+              "properties": {
+                "title": "Glue failed tasks (all job runs)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [ { "expression": "SEARCH('{AWS/Glue,JobName,Type} MetricName=\"glue.driver.aggregate.numFailedTasks\" divakar', 'Sum', 300)", "id": "glueFailed", "label": "failed tasks" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 8, "width": 12, "height": 6,
+              "properties": {
+                "title": "Redshift Serverless activity",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [ "AWS/Redshift-Serverless", "QueriesCompletedPerSecond", "Workgroup", "divakar-${Environment}", { "stat": "Average" } ],
+                  [ ".", "DatabaseConnections", ".", ".", { "stat": "Average" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 14, "width": 24, "height": 6,
+              "properties": {
+                "title": "Lake size (StandardStorage bytes)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Average",
+                "period": 86400,
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "divakar-lake-bronze-${Environment}-${AWS::AccountId}-${AWS::Region}", "StorageType", "StandardStorage", { "label": "bronze" } ],
+                  [ ".", ".", "BucketName", "divakar-lake-silver-${Environment}-${AWS::AccountId}-${AWS::Region}", ".", ".", { "label": "silver" } ],
+                  [ ".", ".", "BucketName", "divakar-lake-gold-${Environment}-${AWS::AccountId}-${AWS::Region}", ".", ".", { "label": "gold" } ]
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  PipelineFunctionName:
+    Value: !Ref PipelineFunction
+  LoaderFunctionName:
+    Value: !Ref LoaderFunction
+  IngestScheduleRuleName:
+    Value: !Ref IngestScheduleRule
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
+  DashboardName:
+    Value: !Ref OpsDashboard
+  DashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=divakar-pipeline-${Environment}"

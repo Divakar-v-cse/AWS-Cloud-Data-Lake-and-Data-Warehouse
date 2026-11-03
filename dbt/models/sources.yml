@@ -1,0 +1,65 @@
+version: 2
+
+sources:
+  - name: dwh
+    schema: dwh
+    description: Dimensional warehouse loaded from the gold lake layer.
+    tables:
+      - name: dim_date
+        columns:
+          - name: date_key
+            tests: [not_null, unique]
+      - name: dim_customer
+        columns:
+          - name: customer_sk
+            tests: [not_null, unique]
+      - name: dim_product
+        columns:
+          - name: product_sk
+            tests: [not_null, unique]
+      - name: dim_payment_method
+        columns:
+          - name: method_key
+            tests: [not_null, unique]
+      - name: fact_orders
+        columns:
+          - name: order_id
+            tests: [not_null, unique]
+          - name: customer_sk
+            tests:
+              - not_null
+              - relationships:
+                  to: source('dwh', 'dim_customer')
+                  field: customer_sk
+          - name: date_key
+            tests:
+              - not_null
+              - relationships:
+                  to: source('dwh', 'dim_date')
+                  field: date_key
+      - name: fact_order_items
+        columns:
+          - name: order_item_id
+            tests: [not_null, unique]
+          - name: order_id
+            tests:
+              - relationships:
+                  to: source('dwh', 'fact_orders')
+                  field: order_id
+      - name: fact_payments
+        columns:
+          - name: payment_id
+            tests: [not_null, unique]
+          - name: order_id
+            tests:
+              - relationships:
+                  to: source('dwh', 'fact_orders')
+                  field: order_id
+      - name: fact_shipments
+        columns:
+          - name: shipment_id
+            tests: [not_null, unique]
+      - name: fact_returns
+        columns:
+          - name: return_id
+            tests: [not_null, unique]

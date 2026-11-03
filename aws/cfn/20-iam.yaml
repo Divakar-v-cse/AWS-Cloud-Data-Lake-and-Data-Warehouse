@@ -1,0 +1,415 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Divakar Cloud Data Lake - least-privilege IAM roles. Every role is scoped to
+  named buckets and named API actions; no wildcard resources except the
+  ReadOnly-style log actions that AWS requires to be unscoped. Stack 2 of 5.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+  BronzeBucket:
+    Type: String
+  SilverBucket:
+    Type: String
+  GoldBucket:
+    Type: String
+  ArtifactsBucket:
+    Type: String
+
+  PartnerApiSecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional Secrets Manager ARN holding the upstream partner API key. Leave
+      blank when the mock/partner API is public; the ingest role then gets no
+      secrets permission at all.
+
+  AdminSecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the Redshift Serverless managed admin-password secret. Supplied by
+      the Redshift stack; only the loader Lambda may read it.
+
+Conditions:
+  HasPartnerSecret: !Not [!Equals [!Ref PartnerApiSecretArn, ""]]
+  HasAdminSecret: !Not [!Equals [!Ref AdminSecretArn, ""]]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Glue ETL: read bronze, write silver/gold, maintain catalog tables.
+  # ---------------------------------------------------------------------------
+  GlueETLRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "divakar-glue-etl-${Environment}"
+      Description: Glue PySpark jobs bronze->silver->gold
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: lake-read-write
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListNamedBuckets
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${BronzeBucket}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${SilverBucket}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${GoldBucket}"
+              - Sid: ReadBronzeWriteSilverGold
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${BronzeBucket}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${SilverBucket}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${GoldBucket}/*"
+              - Sid: WriteSilverGold
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${SilverBucket}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${GoldBucket}/*"
+              # Glue needs a scratch location for --TempDir and for the Spark UI
+              # event logs. Scoped to two prefixes, not the whole bucket.
+              - Sid: JobScratchAndSparkUi
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactsBucket}/tmp/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactsBucket}/spark-ui/*"
+        - PolicyName: catalog-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:UpdatePartition
+                  - glue:BatchUpdatePartition
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/divakar_*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/divakar_*/*"
+        - PolicyName: job-metrics-and-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: Glue
+
+  # ---------------------------------------------------------------------------
+  # Ingest Lambda: pull the partner API and land raw files in bronze only.
+  # ---------------------------------------------------------------------------
+  IngestLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "divakar-ingest-${Environment}"
+      Description: Writes partner API payloads into the bronze bucket
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: bronze-writer
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BronzeBucket}"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:AbortMultipartUpload
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BronzeBucket}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/divakar-ingest-*"
+        - !If
+          - HasPartnerSecret
+          - PolicyName: partner-api-secret
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref PartnerApiSecretArn
+          - !Ref AWS::NoValue
+
+  # ---------------------------------------------------------------------------
+  # Loader Lambda: drives Redshift through the Data API (no VPC driver, no
+  # long-lived password in code) and can kick off the Glue jobs.
+  # ---------------------------------------------------------------------------
+  LoaderLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "divakar-redshift-loader-${Environment}"
+      Description: Runs COPY/ELT against Redshift Serverless via the Data API
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: redshift-data-api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - redshift-data:ExecuteStatement
+                  - redshift-data:DescribeStatement
+                  - redshift-data:GetStatementResult
+                  - redshift-data:CancelStatement
+                  - redshift-data:ListStatements
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - redshift-serverless:GetWorkgroup
+                  - redshift-serverless:GetNamespace
+                  - redshift-serverless:GetCredentials
+                Resource: "*"
+        - PolicyName: read-lake
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${SilverBucket}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${GoldBucket}"
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${SilverBucket}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${GoldBucket}/*"
+        - PolicyName: run-glue-jobs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:GetJob
+                  - glue:BatchStopJobRun
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/divakar-*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:crawler/divakar-*"
+        - PolicyName: logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/divakar-redshift-*"
+        - !If
+          - HasAdminSecret
+          - PolicyName: warehouse-credentials
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref AdminSecretArn
+          - !Ref AWS::NoValue
+
+  # ---------------------------------------------------------------------------
+  # Pipeline role: the orchestrator Lambda. It is the only principal that both
+  # lands raw data in bronze and starts the Glue jobs, so the ingest role stays
+  # write-only-to-bronze and the loader role stays warehouse-only.
+  # ---------------------------------------------------------------------------
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "divakar-pipeline-${Environment}"
+      Description: Ingests to bronze and starts the Glue ETL chain
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: bronze-writer
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BronzeBucket}"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:AbortMultipartUpload
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BronzeBucket}/*"
+        # The replay channel reads the source exports that deploy_aws.py uploads
+        # next to the Glue scripts. Read-only, one prefix.
+        - PolicyName: read-source-exports
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactsBucket}"
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactsBucket}/raw/*"
+        - PolicyName: run-glue-chain
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:GetJob
+                  - glue:BatchStopJobRun
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/divakar-*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:crawler/divakar-*"
+        - PolicyName: logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/divakar-pipeline-*"
+        - !If
+          - HasPartnerSecret
+          - PolicyName: partner-api-secret
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref PartnerApiSecretArn
+          - !Ref AWS::NoValue
+
+  # ---------------------------------------------------------------------------
+  # COPY role: assumed by Redshift itself (not by a person) so the warehouse can
+  # read Parquet from S3 without embedding long-lived keys in SQL.
+  # ---------------------------------------------------------------------------
+  RedshiftCopyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "divakar-redshift-copy-${Environment}"
+      Description: Assumed by Redshift Serverless to COPY from the silver/gold buckets
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - redshift.amazonaws.com
+                - redshift-serverless.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-lake-for-copy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${SilverBucket}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${GoldBucket}"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${SilverBucket}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${GoldBucket}/*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "s3.${AWS::Region}.amazonaws.com"
+
+Outputs:
+  GlueRoleArn:
+    Value: !GetAtt GlueETLRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-GlueRoleArn"
+  IngestRoleArn:
+    Value: !GetAtt IngestLambdaRole.Arn
+  LoaderRoleArn:
+    Value: !GetAtt LoaderLambdaRole.Arn
+  PipelineRoleArn:
+    Value: !GetAtt PipelineRole.Arn
+  RedshiftCopyRoleArn:
+    Value: !GetAtt RedshiftCopyRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RedshiftCopyRoleArn"

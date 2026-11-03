@@ -1,0 +1,24 @@
+divakar_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('WAREHOUSE_HOST', 'localhost') }}"
+      port: "{{ env_var('WAREHOUSE_PORT', '5433') | int }}"
+      user: "{{ env_var('WAREHOUSE_USER', 'deuser') }}"
+      password: "{{ env_var('WAREHOUSE_PASSWORD', 'depass') }}"
+      dbname: "{{ env_var('WAREHOUSE_DB', 'analytics') }}"
+      schema: dwh
+      threads: 4
+      keepalives_idle: 0
+      connect_timeout: 10
+    # Amazon Redshift target - enable when AWS credentials are provisioned
+    redshift:
+      type: redshift
+      host: "{{ env_var('REDSHIFT_HOST', '') }}"
+      port: 5439
+      user: "{{ env_var('REDSHIFT_USER', '') }}"
+      password: "{{ env_var('REDSHIFT_PASSWORD', '') }}"
+      dbname: "{{ env_var('REDSHIFT_DB', 'analytics') }}"
+      schema: dwh
+      threads: 4

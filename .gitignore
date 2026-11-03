@@ -1,0 +1,57 @@
+# ---- credentials and deployment receipts ---------------------------------
+# Never commit real credentials. .env.aws.example is a template with blank
+# values and is intentionally tracked.
+.aws-deploy.json
+.env
+.env.aws
+.env.local
+*.pem
+*.key
+credentials
+secrets.json
+
+# ---- python ---------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+pip-*/
+pip-build-tracker-*/
+pip-ephem-wheel-cache-*/
+pip-install-*/
+
+# ---- node / frontend ------------------------------------------------------
+node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+yarn-error.log*
+.npmcache/
+node-compile-cache/
+
+# ---- generated data and lake contents -------------------------------------
+# Regenerate with: python -m src.generate_data
+# Rebuild the lake with: python -m src.pipeline
+data/
+*.parquet
+
+# ---- dbt runtime ----------------------------------------------------------
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+dbt/.user.yml
+
+# ---- logs, screenshots of failures, editor cruft --------------------------
+logs/
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,308 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Divakar Cloud Data Lake - S3 medallion buckets (bronze/silver/gold/artifacts)
+  and the Glue Data Catalog databases. Stack 1 of 5.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedPattern: "^[a-z0-9-]{2,12}$"
+    Description: Short environment name used in bucket and resource names.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Bronze: immutable landing zone for raw CSV/JSON exactly as received.
+  # ---------------------------------------------------------------------------
+  BronzeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "divakar-lake-bronze-${Environment}-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: transition-raw
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 180
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Project
+          Value: divakar-data-platform
+        - Key: Layer
+          Value: bronze
+
+  # ---------------------------------------------------------------------------
+  # Silver: cleaned, typed, de-duplicated Parquet.
+  # ---------------------------------------------------------------------------
+  SilverBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "divakar-lake-silver-${Environment}-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Project
+          Value: divakar-data-platform
+        - Key: Layer
+          Value: silver
+
+  # ---------------------------------------------------------------------------
+  # Gold: business-level aggregates served to Athena / BI.
+  # ---------------------------------------------------------------------------
+  GoldBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "divakar-lake-gold-${Environment}-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - Key: Project
+          Value: divakar-data-platform
+        - Key: Layer
+          Value: gold
+
+  # ---------------------------------------------------------------------------
+  # Artifacts: Glue scripts, Lambda zips, Athena query results.
+  # ---------------------------------------------------------------------------
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "divakar-lake-artifacts-${Environment}-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-query-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 30
+      Tags:
+        - Key: Project
+          Value: divakar-data-platform
+        - Key: Layer
+          Value: artifacts
+
+  # ---------------------------------------------------------------------------
+  # TLS-only bucket policies. Raw e-commerce data (customer PII) must never be
+  # readable over plaintext HTTP.
+  # ---------------------------------------------------------------------------
+  BronzePolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BronzeBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt BronzeBucket.Arn
+              - !Sub "${BronzeBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  SilverPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SilverBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt SilverBucket.Arn
+              - !Sub "${SilverBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  GoldPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref GoldBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt GoldBucket.Arn
+              - !Sub "${GoldBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  ArtifactsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ArtifactsBucket.Arn
+              - !Sub "${ArtifactsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------------------
+  # Glue Data Catalog: one database per medallion layer.
+  # ---------------------------------------------------------------------------
+  BronzeDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "divakar_bronze_${Environment}"
+        Description: Raw landing zone, one table per source system extract.
+
+  SilverDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "divakar_silver_${Environment}"
+        Description: Cleaned, typed, de-duplicated Parquet.
+
+  GoldDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "divakar_gold_${Environment}"
+        Description: Business aggregates for Athena and BI.
+
+Outputs:
+  BronzeBucketName:
+    Value: !Ref BronzeBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BronzeBucket"
+  SilverBucketName:
+    Value: !Ref SilverBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-SilverBucket"
+  GoldBucketName:
+    Value: !Ref GoldBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-GoldBucket"
+  ArtifactsBucketName:
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ArtifactsBucket"
+  BronzeBucketArn:
+    Value: !GetAtt BronzeBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BronzeBucketArn"
+  SilverBucketArn:
+    Value: !GetAtt SilverBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SilverBucketArn"
+  GoldBucketArn:
+    Value: !GetAtt GoldBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-GoldBucketArn"
+  ArtifactsBucketArn:
+    Value: !GetAtt ArtifactsBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ArtifactsBucketArn"
+  BronzeDatabase:
+    Value: !Ref BronzeDatabase
+    Export:
+      Name: !Sub "${AWS::StackName}-BronzeDatabase"
+  SilverDatabase:
+    Value: !Ref SilverDatabase
+    Export:
+      Name: !Sub "${AWS::StackName}-SilverDatabase"
+  GoldDatabase:
+    Value: !Ref GoldDatabase
+    Export:
+      Name: !Sub "${AWS::StackName}-GoldDatabase"

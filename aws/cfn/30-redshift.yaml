@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Divakar Cloud Data Lake - Amazon Redshift Serverless warehouse. Serverless is
+  used instead of a provisioned cluster so the stack has no idle compute charge
+  between runs and needs no cluster resizing. Stack 3 of 5.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the Redshift workgroup (the default VPC is fine).
+
+  SubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet in AZ A. Redshift Serverless requires at least two AZs.
+
+  SubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet in AZ B (must differ from SubnetId1).
+
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      CIDR allowed to reach port 5439. Set this to your public IP /32 so the
+      dashboard can connect from your laptop. 0.0.0.0/0 is only acceptable for
+      a throwaway environment.
+
+  AdminUsername:
+    Type: String
+    Default: deuser
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9_]{0,127}$"
+
+  DatabaseName:
+    Type: String
+    Default: analytics
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9_]{0,63}$"
+
+  BaseCapacity:
+    Type: Number
+    Default: 8
+    MinValue: 8
+    MaxValue: 512
+    Description: Redshift Processing Units. 8 RPU is the smallest and cheapest.
+
+  CopyRoleArn:
+    Type: String
+    Description: IAM role Redshift assumes to COPY from S3.
+
+  PubliclyAccessible:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Redshift Serverless SQL access on 5439
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5439
+          ToPort: 5439
+          CidrIp: !Ref AllowedCidr
+          Description: SQL clients (dashboard, psql, dbt)
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Egress for COPY and logging
+      Tags:
+        - Key: Project
+          Value: divakar-data-platform
+
+  Namespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: !Sub "divakar-${Environment}"
+      DbName: !Ref DatabaseName
+      AdminUsername: !Ref AdminUsername
+      # AWS generates a strong admin password, stores it in Secrets Manager and
+      # rotates it. No password ever appears in the template or in code.
+      ManageAdminPassword: true
+      IamRoles:
+        - !Ref CopyRoleArn
+      LogExports:
+        - userlog
+        - connectionlog
+        - useractivitylog
+      Tags:
+        - Key: Project
+          Value: divakar-data-platform
+
+  Workgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    Properties:
+      WorkgroupName: !Sub "divakar-${Environment}"
+      # Same name as the namespace resource above; Redshift Serverless requires
+      # the workgroup to point at an existing namespace in the same account.
+      NamespaceName: !Sub "divakar-${Environment}"
+      BaseCapacity: !Ref BaseCapacity
+      PubliclyAccessible: !Ref PubliclyAccessible
+      SubnetIds:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+      SecurityGroupIds:
+        - !GetAtt SecurityGroup.GroupId
+      # ConfigParameters is a list of {ParameterKey, ParameterValue} pairs, not a
+      # map. require_ssl is the important one: plaintext connections are refused.
+      ConfigParameters:
+        - ParameterKey: require_ssl
+          ParameterValue: "true"
+        - ParameterKey: enable_user_activity_logging
+          ParameterValue: "true"
+        - ParameterKey: max_query_execution_time
+          ParameterValue: "3600"
+      Tags:
+        - Key: Project
+          Value: divakar-data-platform
+
+Outputs:
+  WorkgroupName:
+    Value: !Ref Workgroup
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkgroupName"
+  NamespaceName:
+    Value: !Ref Namespace
+    Export:
+      Name: !Sub "${AWS::StackName}-NamespaceName"
+  DatabaseName:
+    Value: !Ref DatabaseName
+    Export:
+      Name: !Sub "${AWS::StackName}-DatabaseName"
+  AdminUsername:
+    Value: !Ref AdminUsername
+  CopyRoleArn:
+    Value: !Ref CopyRoleArn
+  # The endpoint host, port and admin-password secret ARN are deliberately not
+  # exported: they are read-only attributes whose GetAtt spelling differs across
+  # cfn-lint schema versions, and a wrong name fails the whole stack at deploy
+  # time. scripts/deploy_aws.py resolves all three from the service API instead:
+  #   aws redshift-serverless get-workgroup  --workgroup-name divakar-dev
+  #   aws redshift-serverless get-namespace  --namespace-name  divakar-dev
+  # and writes them to .aws-deploy.json.
